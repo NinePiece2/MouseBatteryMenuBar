@@ -1,0 +1,24 @@
+{
+    "configurations": [
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:LogiMouseBatteryMenuBar}",
+            "name": "Debug LogiMouseBatteryMenuBar",
+            "target": "LogiMouseBatteryMenuBar",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug LogiMouseBatteryMenuBar"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:LogiMouseBatteryMenuBar}",
+            "name": "Release LogiMouseBatteryMenuBar",
+            "target": "LogiMouseBatteryMenuBar",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release LogiMouseBatteryMenuBar"
+        }
+    ]
+}
