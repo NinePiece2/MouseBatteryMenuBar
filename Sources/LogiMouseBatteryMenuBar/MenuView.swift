@@ -60,12 +60,10 @@ struct MenuView: View {
 
             Divider()
 
-            // Menu Bar Options
             Toggle("Show Percentage in Bar", isOn: $service.showPercentageInMenuBar)
                 .font(.system(size: 11))
                 .toggleStyle(.checkbox)
 
-            // Refresh Interval Settings Picker
             HStack {
                 Text("Refresh Interval:")
                     .font(.system(size: 11))
@@ -84,13 +82,13 @@ struct MenuView: View {
             Divider()
 
             HStack {
-                Button("Refresh Now") {
-                    service.refreshDevices()
-                }
-                .buttonStyle(.borderless)
-                .font(.system(size: 11))
+                // Button("Refresh Now") {
+                //     service.refreshDevices()
+                // }
+                // .buttonStyle(.borderless)
+                // .font(.system(size: 11))
                 
-                Spacer()
+                // Spacer()
 
                 Button("Quit") {
                     NSApplication.shared.terminate(nil)

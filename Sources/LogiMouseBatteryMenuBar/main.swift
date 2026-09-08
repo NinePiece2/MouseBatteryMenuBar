@@ -41,46 +41,79 @@ final class IOHIDDeviceManager: @unchecked Sendable {
     private let responseLock = NSLock()
     private var pendingResponses: [UInt8: [UInt8]] = [:]
 
-    init?() {
+    var onDevicesChanged: (() -> Void)?
+
+    init() {
         manager = IOHIDManagerCreate(kCFAllocatorDefault, IOOptionBits(kIOHIDOptionsTypeNone))
-        guard let manager = manager else { return nil }
+        guard let manager = manager else { return }
 
         let matchingDict: [String: Any] = [
             kIOHIDVendorIDKey as String: 0x046D
         ]
 
         IOHIDManagerSetDeviceMatching(manager, matchingDict as CFDictionary)
+
+        let context = Unmanaged.passUnretained(self).toOpaque()
+
+        IOHIDManagerRegisterDeviceMatchingCallback(manager, { context, result, sender, device in
+            guard let context = context else { return }
+            let mySelf = Unmanaged<IOHIDDeviceManager>.fromOpaque(context).takeUnretainedValue()
+            mySelf.deviceConnected(device)
+        }, context)
+
+        IOHIDManagerRegisterDeviceRemovalCallback(manager, { context, result, sender, device in
+            guard let context = context else { return }
+            let mySelf = Unmanaged<IOHIDDeviceManager>.fromOpaque(context).takeUnretainedValue()
+            mySelf.deviceDisconnected(device)
+        }, context)
+
         IOHIDManagerScheduleWithRunLoop(manager, CFRunLoopGetMain(), CFRunLoopMode.defaultMode.rawValue)
         IOHIDManagerOpen(manager, IOOptionBits(kIOHIDOptionsTypeNone))
+        debugLog("IOHIDManager initialized with hotplug support.")
+    }
 
-        guard let deviceSet = IOHIDManagerCopyDevices(manager) as? Set<IOHIDDevice>, !deviceSet.isEmpty else {
-            debugLog("No Logitech USB/Bluetooth devices attached via IOHIDManager.")
-            return nil
+    private func setupDevice(_ dev: IOHIDDevice) {
+        responseLock.lock()
+        if devices.contains(dev) {
+            responseLock.unlock()
+            return
         }
+        devices.append(dev)
+        responseLock.unlock()
 
-        self.devices = Array(deviceSet)
+        IOHIDDeviceOpen(dev, IOOptionBits(kIOHIDOptionsTypeNone))
         
         let context = Unmanaged.passUnretained(self).toOpaque()
         let reportBuffer = UnsafeMutablePointer<UInt8>.allocate(capacity: 64)
 
-        for dev in self.devices {
-            IOHIDDeviceOpen(dev, IOOptionBits(kIOHIDOptionsTypeNone))
-            
-            IOHIDDeviceRegisterInputReportCallback(
-                dev,
-                reportBuffer,
-                64,
-                { context, result, sender, type, reportID, report, reportLength in
-                    guard let context = context else { return }
-                    let mySelf = Unmanaged<IOHIDDeviceManager>.fromOpaque(context).takeUnretainedValue()
-                    let bytes = Array(UnsafeBufferPointer(start: report, count: reportLength))
-                    mySelf.handleInputReport(bytes)
-                },
-                context
-            )
-            IOHIDDeviceScheduleWithRunLoop(dev, CFRunLoopGetMain(), CFRunLoopMode.defaultMode.rawValue)
-        }
-        debugLog("Successfully connected to \(self.devices.count) Logitech HID interface(s).")
+        IOHIDDeviceRegisterInputReportCallback(
+            dev,
+            reportBuffer,
+            64,
+            { context, result, sender, type, reportID, report, reportLength in
+                guard let context = context else { return }
+                let mySelf = Unmanaged<IOHIDDeviceManager>.fromOpaque(context).takeUnretainedValue()
+                let bytes = Array(UnsafeBufferPointer(start: report, count: reportLength))
+                mySelf.handleInputReport(bytes)
+            },
+            context
+        )
+        IOHIDDeviceScheduleWithRunLoop(dev, CFRunLoopGetMain(), CFRunLoopMode.defaultMode.rawValue)
+    }
+
+    private func deviceConnected(_ device: IOHIDDevice) {
+        setupDevice(device)
+        debugLog("Hotplug: Logitech device connected.")
+        onDevicesChanged?()
+    }
+
+    private func deviceDisconnected(_ device: IOHIDDevice) {
+        responseLock.lock()
+        devices.removeAll { $0 == device }
+        IOHIDDeviceClose(device, IOOptionBits(kIOHIDOptionsTypeNone))
+        responseLock.unlock()
+        debugLog("Hotplug: Logitech device disconnected.")
+        onDevicesChanged?()
     }
 
     private func handleInputReport(_ bytes: [UInt8]) {
@@ -91,16 +124,13 @@ final class IOHIDDeviceManager: @unchecked Sendable {
         responseLock.unlock()
     }
 
-    // Query device name using feature 0x0005 (GetDeviceNameType)
     func getDeviceName(deviceIndex: UInt8) -> String? {
-        // 1. Look up feature index for root feature 0x0005
         guard let featResp = sendAndReceive(deviceIndex: deviceIndex, featureIndex: 0x00, function: 0x00, params: [0x00, 0x05]),
               featResp.count >= 5, featResp[4] != 0 else {
             return nil
         }
         let featureIndex = featResp[4]
 
-        // 2. GetNameLength (GetCount) -> Function 0x00
         guard let countResp = sendAndReceive(deviceIndex: deviceIndex, featureIndex: featureIndex, function: 0x00, params: []),
               countResp.count >= 5 else {
             return nil
@@ -108,24 +138,23 @@ final class IOHIDDeviceManager: @unchecked Sendable {
         let nameLength = Int(countResp[4])
         guard nameLength > 0 else { return nil }
 
-        // 3. GetDeviceName chunks -> Function 0x10 (chunk size varies by transport, usually reading stepping by 3 or 16 bytes)
         var nameBytes: [UInt8] = []
         var charIndex: UInt8 = 0
         
-        while charIndex < nameLength {
+        while charIndex < UInt8(nameLength) {
             guard let nameResp = sendAndReceive(deviceIndex: deviceIndex, featureIndex: featureIndex, function: 0x10, params: [charIndex]),
                   nameResp.count > 4 else { break }
             
             let chunk = Array(nameResp[4..<nameResp.count])
-            var addedInThisChunk = 0
+            if chunk.isEmpty { break }
+            
             for byte in chunk {
-                if byte == 0 || nameBytes.count >= nameLength { break }
-                nameBytes.append(byte)
-                addedInThisChunk += 1
+                if byte != 0 && nameBytes.count < nameLength {
+                    nameBytes.append(byte)
+                }
             }
             
-            if addedInThisChunk == 0 { break }
-            charIndex += UInt8(addedInThisChunk)
+            charIndex += UInt8(chunk.count)
         }
 
         if !nameBytes.isEmpty, let name = String(bytes: nameBytes, encoding: .utf8)?.trimmingCharacters(in: .controlCharacters.union(.whitespacesAndNewlines)), !name.isEmpty {
@@ -146,10 +175,10 @@ final class IOHIDDeviceManager: @unchecked Sendable {
 
         responseLock.lock()
         pendingResponses.removeValue(forKey: deviceIndex)
+        let currentDevices = self.devices
         responseLock.unlock()
 
-        var sendSuccess = false
-        for device in devices {
+        for device in currentDevices {
             let setRes = IOHIDDeviceSetReport(
                 device,
                 kIOHIDReportTypeOutput,
@@ -159,23 +188,18 @@ final class IOHIDDeviceManager: @unchecked Sendable {
             )
 
             if setRes == kIOReturnSuccess {
-                sendSuccess = true
-                break
+                let deadline = Date().addingTimeInterval(0.08)
+                while Date() < deadline {
+                    responseLock.lock()
+                    if let resp = pendingResponses[deviceIndex] {
+                        pendingResponses.removeValue(forKey: deviceIndex)
+                        responseLock.unlock()
+                        return resp
+                    }
+                    responseLock.unlock()
+                    Thread.sleep(forTimeInterval: 0.005)
+                }
             }
-        }
-
-        guard sendSuccess else { return nil }
-
-        let deadline = Date().addingTimeInterval(0.2)
-        while Date() < deadline {
-            responseLock.lock()
-            if let resp = pendingResponses[deviceIndex] {
-                pendingResponses.removeValue(forKey: deviceIndex)
-                responseLock.unlock()
-                return resp
-            }
-            responseLock.unlock()
-            Thread.sleep(forTimeInterval: 0.005)
         }
 
         return nil
@@ -197,14 +221,29 @@ final class MouseService: ObservableObject {
 
     private var hid: IOHIDDeviceManager?
     private var timer: Timer?
+    private var refreshWorkItem: DispatchWorkItem?
 
     init() {
         self.showPercentageInMenuBar = UserDefaults.standard.object(forKey: "showPercentageInMenuBar") as? Bool ?? true
-        self.hid = IOHIDDeviceManager()
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
-            self?.refreshDevices()
+        let hidManager = IOHIDDeviceManager()
+        hidManager.onDevicesChanged = { [weak self] in
+            Task { @MainActor in
+                self?.debouncedRefreshDevices()
+            }
         }
+        self.hid = hidManager
+
+        debouncedRefreshDevices()
         setupTimer()
+    }
+
+    private func debouncedRefreshDevices() {
+        refreshWorkItem?.cancel()
+        let workItem = DispatchWorkItem { [weak self] in
+            self?.refreshDevicesWithRetry()
+        }
+        refreshWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0, execute: workItem)
     }
 
     private func setupTimer() {
@@ -223,6 +262,10 @@ final class MouseService: ObservableObject {
     }
 
     func refreshDevices() {
+        refreshDevicesWithRetry(attempt: 1)
+    }
+
+    private func refreshDevicesWithRetry(attempt: Int = 1) {
         guard let hid = hid else {
             lastError = "Could not initialize IOHIDManager interface."
             return
@@ -249,23 +292,41 @@ final class MouseService: ObservableObject {
 
             let results = foundMice
             await MainActor.run { [results] in
-                self.devices = results
-                if self.selectedDeviceID == nil || !results.contains(where: { $0.id == self.selectedDeviceID }) {
-                    self.selectedDeviceID = self.devices.first?.id
+                if results.isEmpty && attempt < 4 {
+                    debugLog("No devices found on attempt \(attempt). Retrying in 1 second...")
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+                        self.refreshDevicesWithRetry(attempt: attempt + 1)
+                    }
+                    return
                 }
-                self.refreshBattery()
+
+                self.devices = results
+                if results.isEmpty {
+                    self.selectedDeviceID = nil
+                    self.batteryState = .unknown
+                    debugLog("No devices found. Resetting battery state to unknown.")
+                } else {
+                    if self.selectedDeviceID == nil || !results.contains(where: { $0.id == self.selectedDeviceID }) {
+                        self.selectedDeviceID = results.first?.id
+                    }
+                    self.refreshBattery()
+                }
             }
         }
     }
 
     func refreshBattery() {
         guard let device = devices.first(where: { $0.id == selectedDeviceID }),
-              let hid = hid else { return }
+              let hid = hid else {
+            DispatchQueue.main.async {
+                self.batteryState = .unknown
+            }
+            return
+        }
 
         Task.detached {
             let slot = device.deviceIndex
 
-            // 1. Try Feature 0x1004 (Unified Battery)
             if let featResp = hid.sendAndReceive(deviceIndex: slot, featureIndex: 0x00, function: 0x00, params: [0x10, 0x04]),
                featResp.count >= 5, featResp[4] != 0 {
                 let batFeatIdx = featResp[4]
@@ -283,7 +344,6 @@ final class MouseService: ObservableObject {
                 }
             }
 
-            // 2. Try Feature 0x1000 (Legacy Battery)
             if let featResp = hid.sendAndReceive(deviceIndex: slot, featureIndex: 0x00, function: 0x00, params: [0x10, 0x00]),
                featResp.count >= 5, featResp[4] != 0 {
                 let batFeatIdx = featResp[4]
@@ -318,7 +378,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.setActivationPolicy(.accessory)
 
         popover = NSPopover()
-        popover.contentSize = NSSize(width: 240, height: 250)
+        popover.contentSize = NSSize(width: 240, height: 260)
         popover.behavior = .transient
         popover.contentViewController = NSHostingController(rootView: MenuView(service: service))
 
@@ -376,7 +436,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         button.needsDisplay = true
     }
 
-     private func createCombinedImage(batterySymbolName: String) -> NSImage {
+    private func createCombinedImage(batterySymbolName: String) -> NSImage {
         let config = NSImage.SymbolConfiguration(pointSize: 14, weight: .regular)
         let mouseImage = NSImage(systemSymbolName: "computermouse", accessibilityDescription: "Mouse")?.withSymbolConfiguration(config)
         let batteryImage = NSImage(systemSymbolName: batterySymbolName, accessibilityDescription: "Battery")?.withSymbolConfiguration(config)
