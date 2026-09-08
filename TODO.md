@@ -1,3 +1,4 @@
 - [ ] Add Build Pipeline
 - [ ] Rename App
 - [ ] Add option to start the app on startup
+- [ ] Add persistant configurations
