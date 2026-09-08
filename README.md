@@ -15,7 +15,13 @@ A lightweight macOS menu-bar application for Logitech mice. It reads HID++ batte
 
 ## Images
 
+**Wireless Mode**
 
+![images/wired.png](images/wired.png)
+
+**Wired Mode**
+
+![images/wireless.png](images/wireless.png)
 
 ## Build and Run
 
